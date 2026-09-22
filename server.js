@@ -2,6 +2,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { randomInt, randomUUID } = require('node:crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 const { WORLD, CONFIG: C, RULES: R, TEAMS, OBSTACLES, move, segmentRect, segmentCircle } = require('./shared');
@@ -13,10 +14,10 @@ function cleanName(value) {
 
 class Arena {
   constructor() { this.rooms = new Map(); this.clients = new Map(); this.bulletId = 0; }
-  connect(ws) {
+  connect(ws, inviteBase = null) {
     const client = { id: randomUUID(), ws, room: null, lastInput: 0, messages: 0, window: Date.now() };
     this.clients.set(client.id, client);
-    this.send(client, { type: 'hello', id: client.id });
+    this.send(client, { type: 'hello', id: client.id, inviteBase });
     return client;
   }
   send(client, message) {
@@ -82,6 +83,7 @@ class Arena {
       if (room.host !== client.id || room.phase !== 'ended') return this.error(client, 'Chỉ chủ phòng được đưa cả phòng về sảnh sau trận.');
       room.phase = 'lobby'; room.result = null; room.bullets = [];
       for (const member of room.players.values()) { member.ready = false; member.input = EMPTY_INPUT(); }
+      room.teams = room.teams.filter(t => [...room.players.values()].some(member => member.team === t.id));
       return this.broadcastRoom(room);
     }
     if (room.phase !== 'lobby') return this.error(client, 'Không thể đổi đội khi trận đấu đã bắt đầu.');
@@ -255,10 +257,14 @@ function createServer() {
       try { allowed &&= new URL(req.headers.origin).host === req.headers.host; } catch { allowed = false; }
     }
     if (!allowed || wss.clients.size >= 1200) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   });
-  wss.on('connection', ws => {
-    const client = arena.connect(ws); ws.alive = true;
+  wss.on('connection', (ws, req) => {
+    const localHost = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(req.headers.host || '');
+    const lan = Object.values(os.networkInterfaces()).flat().find(i => i.family === 'IPv4' && !i.internal);
+    const port = server.address().port;
+    const inviteBase = process.env.PUBLIC_URL || (localHost && lan ? `http://${lan.address}:${port}` : null);
+    const client = arena.connect(ws, inviteBase); ws.alive = true;
     ws.on('pong', () => { ws.alive = true; });
     ws.on('message', (data, binary) => { if (!binary) arena.receive(client, data.toString()); });
     ws.on('close', () => arena.disconnect(client));
@@ -286,6 +292,10 @@ function createServer() {
 if (require.main === module) {
   const app = createServer(), port = Number(process.env.PORT || 3000), host = process.env.HOST || '0.0.0.0';
   app.server.listen(port, host, () => console.log(`NEON STRIKE: http://localhost:${port} — dùng địa chỉ LAN của máy này để mời bạn bè.`));
+  app.server.on('error', error => {
+    console.error(error.code === 'EADDRINUSE' ? `Cổng ${port} đang được sử dụng. Đổi PORT hoặc tắt máy chủ cũ.` : error.message);
+    app.close().finally(() => process.exit(1));
+  });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => app.close().then(() => process.exit(0)));
 }
 module.exports = { Arena, createServer, cleanName };

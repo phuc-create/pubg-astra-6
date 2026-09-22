@@ -4,7 +4,7 @@
   const { RULES, TEAMS, move } = NeonShared;
   const net = { socket: null, me: null, room: null, online: false, opened: false, busy: false,
     seq: 0, history: new Map(), actors: new Map(), shots: [], self: null, lastMessage: 0,
-    reload: false, dash: false, ping: 0, correctedX: 0, correctedY: 0, samplesAt: 0 };
+    reload: false, dash: false, ping: 0, correctedX: 0, correctedY: 0, samplesAt: 0, inviteBase: null };
   const escapeText = value => String(value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
   const teamById = id => TEAMS.find(t => t.id === id);
   const mine = () => net.room?.players.find(p => p.id === net.me);
@@ -16,7 +16,7 @@
     <div class="mp-topline"><div class="eyebrow"><span></span> SQUAD OPERATIONS <span class="edition">04 ĐỘI / 12 NGƯỜI</span></div><button class="mp-link" id="mpExit" type="button">← TRỞ LẠI</button></div>
     <div id="mpEntry">
       <h2 id="mpTitle">CÙNG ĐỘI. <em>CÙNG CHIẾN TUYẾN.</em></h2>
-      <p>Tạo phòng riêng và gửi mã cho bạn bè. Chọn màu đội, sẵn sàng và vào trận.</p>
+      <p>Tạo phòng riêng và gửi mã cho bạn bè. Mọi người cần mở cùng địa chỉ máy chủ để tìm thấy nhau.</p>
       <div class="mp-entry-grid"><div>
         <label class="mp-field" for="mpName">TÊN NGƯỜI CHƠI<input id="mpName" autocomplete="nickname" maxlength="18" placeholder="Tên của bạn" required></label>
         <button id="mpCreate" class="primary-button" type="button"><span>TẠO PHÒNG MỚI</span><span class="button-arrow">+</span></button>
@@ -57,7 +57,7 @@
     net.busy = value;
     for (const id of ['mpCreate', 'mpJoin']) $(id).disabled = value;
     clearTimeout(busyTimer);
-    if (value) busyTimer = setTimeout(() => { setBusy(false); setNotice('Máy chủ chưa phản hồi. Hãy kiểm tra kết nối và thử lại.'); }, 7000);
+    if (value) busyTimer = setTimeout(() => { setBusy(false); setNotice('Máy chủ chưa phản hồi. Hãy kiểm tra kết nối và thử lại.'); }, 20000);
   }
   showScreen = function (name) { solo.showScreen(name); modal.hidden = name !== 'multiplayer'; };
   function screen(name) {
@@ -66,6 +66,7 @@
     showScreen('multiplayer'); ui.pauseButton.disabled = true;
     $('mpEntry').hidden = name !== 'entry'; $('mpLobby').hidden = name !== 'lobby'; $('mpResults').hidden = name !== 'results';
     $('mpExit').textContent = net.room ? '← RỜI PHÒNG' : '← TRỞ LẠI';
+    modal.scrollTop = 0;
     modal.setAttribute('aria-label', name === 'lobby' ? 'Sảnh phòng đấu đội' : name === 'results' ? 'Kết quả đấu đội' : 'Chơi cùng bạn bè');
     matchHud.hidden = true; respawnHud.hidden = true; ui.waveBanner.classList.remove('visible');
     updateHud();
@@ -79,31 +80,46 @@
     if (net.busy) return;
     setNotice(''); if (send(message)) setBusy(true); else setNotice('Mất kết nối máy chủ. Hãy vào lại phòng.');
   }
-  async function connect() {
-    if (location.protocol === 'file:') throw new Error('Để chơi nhiều người, chạy npm start rồi mở http://localhost:3000.');
-    if (net.socket?.readyState === WebSocket.OPEN && net.me) return;
-    await new Promise((resolve, reject) => {
+  function connectOnce() {
+    return new Promise((resolve, reject) => {
       const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
-      net.socket = socket;
+      net.socket = socket; net.me = null;
       let settled = false;
-      const timer = setTimeout(() => { socket.close(); reject(new Error('Không thể kết nối máy chủ. Kiểm tra máy chủ đang chạy rồi thử lại.')); }, 6000);
+      const fail = () => {
+        clearTimeout(timer);
+        if (net.socket === socket) net.socket = null;
+        socket.close(); reject(new Error(`Không thể mở kết nối đến ${location.host}. Kiểm tra máy chủ đang chạy và mở đúng link mời.`));
+      };
+      const timer = setTimeout(fail, 4500);
       socket.addEventListener('message', event => {
         if (net.socket !== socket) return;
         let message; try { message = JSON.parse(event.data); } catch { return; }
         net.lastMessage = performance.now();
-        if (message.type === 'hello') { net.me = message.id; settled = true; clearTimeout(timer); resolve(); }
+        if (message.type === 'hello') { net.me = message.id; net.inviteBase = message.inviteBase; settled = true; clearTimeout(timer); resolve(); }
         else receive(message);
       });
-      socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Không thể kết nối máy chủ. Hãy mở trò chơi từ địa chỉ của máy chủ.')); });
+      socket.addEventListener('error', () => { if (!settled) fail(); });
       socket.addEventListener('close', () => {
         clearTimeout(timer);
-        if (!settled) reject(new Error('Kết nối bị đóng. Hãy thử lại.'));
+        if (!settled) { fail(); return; }
         if (net.socket !== socket) return;
         const wasActive = net.room || net.opened;
         net.socket = null; resetNetwork();
         if (wasActive) { screen('entry'); setNotice('Đã mất kết nối. Nhập lại mã phòng để tham gia khi phòng ở sảnh.'); }
       });
     });
+  }
+  async function connect() {
+    if (location.protocol === 'file:') throw new Error('Để chơi nhiều người, chạy npm start rồi mở http://localhost:3000.');
+    if (net.socket?.readyState === WebSocket.OPEN && net.me) return;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { await connectOnce(); return; }
+      catch (error) {
+        if (!net.opened || attempt === 2) throw error;
+        setNotice(`Kết nối bị gián đoạn. Đang thử lại (${attempt + 2}/3)…`);
+        await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
   }
   async function enter(type) {
     if (net.busy) return;
@@ -187,7 +203,7 @@
     net.online = false; net.shots = []; clearPointer(); document.body.classList.remove('neon-online');
     screen('results');
     const winner = teamById(net.room.result?.winner), host = net.room.host === net.me;
-    $('mpResultTitle').textContent = winner ? `${winner.name} CHIẾN THẮNG!` : 'HAI BÊN NGANG TÀI!';
+    $('mpResultTitle').textContent = winner ? `${winner.name} CHIẾN THẮNG!` : 'TRẬN ĐẤU HÒA!';
     $('mpResultTitle').style.color = winner?.color || PALETTE.gold;
     $('mpResultReason').textContent = net.room.result?.reason || 'Trận đấu kết thúc.';
     $('mpResultScores').innerHTML = [...net.room.teams].sort((a, b) => b.score - a.score).map(t => `<div class="mp-result-row" style="--team-color:${t.color}"><span>${t.symbol} ${t.name}${mine()?.team === t.id ? ' · ĐỘI CỦA BẠN' : ''}</span><strong>${t.score}</strong></div>`).join('');
@@ -349,8 +365,8 @@
   }
   $('mpCopy').addEventListener('click', () => copy(net.room.code, 'Đã sao chép mã phòng. Gửi cho bạn bè để cùng vào đội.'));
   $('mpCopyLink').addEventListener('click', () => {
-    const url = new URL(location.href); url.search = ''; url.searchParams.set('room', net.room.code);
-    copy(url.href, 'Đã sao chép link mời. Bạn bè cần truy cập được cùng máy chủ.');
+    const url = new URL(net.inviteBase || location.origin); url.searchParams.set('room', net.room.code);
+    copy(url.href, net.inviteBase ? 'Đã sao chép link mạng LAN. Gửi cho bạn bè dùng cùng Wi-Fi / mạng nội bộ.' : 'Đã sao chép link mời. Bạn bè cần truy cập được cùng máy chủ.');
   });
   window.addEventListener('pagehide', () => { send({ type: 'leave' }); net.socket?.close(); });
   if (inviteCode) { screen('entry'); $('mpName').focus(); }

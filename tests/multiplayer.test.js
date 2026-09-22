@@ -71,12 +71,11 @@ test('invalid names, malformed packets and nonexistent rooms fail without crashi
 
 test('joining or changing teams mid-match is rejected', () => {
   const f = match(); f.send(1, { type: 'createTeam' }); assert.match(f.last(1).message, /trận đấu đã bắt đầu/);
+  let extraMessage;
   const extra = f.arena.connect({ readyState: 1, bufferedAmount: 0, send: text => { extraMessage = JSON.parse(text); } });
-  let unused = extra;
-  f.arena.receive(unused, JSON.stringify({ type: 'join', code: f.room.code, name: 'Late' }));
+  f.arena.receive(extra, JSON.stringify({ type: 'join', code: f.room.code, name: 'Late' }));
   assert.match(extraMessage.message, /đang diễn ra/);
 });
-let extraMessage;
 
 test('snapshots only carry overhead names for teammates', () => {
   const f = match(); f.arena.snapshot(f.room);
@@ -155,6 +154,8 @@ test('disconnect transfers ownership, ends a match without opponents and cleans 
   const f = match();
   f.arena.disconnect(f.clients[0]); assert.equal(f.room.host, f.clients[1].id); assert.equal(f.room.phase, 'playing');
   f.arena.disconnect(f.clients[2]); assert.equal(f.room.phase, 'ended'); assert.equal(f.room.result.winner, 'mint');
+  f.send(1, { type: 'back' }); assert.equal(f.room.teams.length, 1);
+  f.send(1, { type: 'ready', ready: true }); f.send(1, { type: 'start' }); assert.equal(f.room.phase, 'lobby');
   f.arena.disconnect(f.clients[1]); assert.equal(f.arena.rooms.size, 0);
 });
 
@@ -166,7 +167,7 @@ test('independent WebSocket clients share rooms, movement and combat on the real
   assert.equal((await fetch(base + '/server.js')).status, 404);
   const peers = [];
   for (let i = 0; i < 3; i++) {
-    const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws'), messages = [];
+    const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws', { origin: base }), messages = [];
     ws.on('message', data => messages.push(JSON.parse(data)));
     peers.push({ ws, messages, send: data => ws.send(JSON.stringify(data)) });
     await once(ws, 'open');
