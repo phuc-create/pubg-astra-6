@@ -113,7 +113,7 @@ class Arena {
         return this.error(client, 'Tất cả người chơi cần chọn đội và sẵn sàng.');
       room.phase = 'playing'; room.elapsed = 0; room.bullets = []; room.events = []; room.result = null;
       for (const t of room.teams) t.score = 0;
-      for (const member of room.players.values()) { member.kills = 0; member.deaths = 0; this.spawn(room, member); }
+      for (const member of room.players.values()) { member.kills = 0; member.deaths = 0; member.seq = -1; this.spawn(room, member); }
       this.broadcastRoom(room); this.snapshot(room);
     }
   }
