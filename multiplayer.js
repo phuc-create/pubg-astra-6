@@ -82,13 +82,15 @@
   }
   function connectOnce() {
     return new Promise((resolve, reject) => {
-      const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
+      // The same URL works locally; Vercel rewrites /ws to the /api/ws Function.
+      const endpoint = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+      const socket = new WebSocket(endpoint);
       net.socket = socket; net.me = null;
       let settled = false;
       const fail = () => {
         clearTimeout(timer);
         if (net.socket === socket) net.socket = null;
-        socket.close(); reject(new Error(`Không thể mở kết nối đến ${location.host}. Kiểm tra máy chủ đang chạy và mở đúng link mời.`));
+        socket.close(); reject(new Error(`Không thể mở kết nối đến ${new URL(endpoint).host}. Kiểm tra máy chủ đang chạy và mở đúng link mời.`));
       };
       const timer = setTimeout(fail, 4500);
       socket.addEventListener('message', event => {
@@ -105,7 +107,7 @@
         if (net.socket !== socket) return;
         const wasActive = net.room || net.opened;
         net.socket = null; resetNetwork();
-        if (wasActive) { screen('entry'); setNotice('Đã mất kết nối. Nhập lại mã phòng để tham gia khi phòng ở sảnh.'); }
+        if (wasActive) { screen('entry'); setNotice('Phiên kết nối đã đóng hoặc hết hạn. Vào lại phòng nếu còn mã hợp lệ, hoặc tạo phòng mới.'); }
       });
     });
   }
@@ -365,8 +367,8 @@
   }
   $('mpCopy').addEventListener('click', () => copy(net.room.code, 'Đã sao chép mã phòng. Gửi cho bạn bè để cùng vào đội.'));
   $('mpCopyLink').addEventListener('click', () => {
-    const url = new URL(net.inviteBase || location.origin); url.searchParams.set('room', net.room.code);
-    copy(url.href, net.inviteBase ? 'Đã sao chép link mạng LAN. Gửi cho bạn bè dùng cùng Wi-Fi / mạng nội bộ.' : 'Đã sao chép link mời. Bạn bè cần truy cập được cùng máy chủ.');
+    const url = new URL(net.inviteBase || location.origin); url.search = ''; url.searchParams.set('room', net.room.code);
+    copy(url.href, net.inviteBase?.startsWith('http://') ? 'Đã sao chép link mạng LAN. Gửi cho bạn bè dùng cùng Wi-Fi / mạng nội bộ.' : 'Đã sao chép link mời. Gửi link này cho bạn bè để vào cùng phòng.');
   });
   window.addEventListener('pagehide', () => { send({ type: 'leave' }); net.socket?.close(); });
   if (inviteCode) { screen('entry'); $('mpName').focus(); }

@@ -233,8 +233,9 @@ class Arena {
   }
 }
 
-function createServer() {
+function createServer({ serverless = false } = {}) {
   const arena = new Arena();
+  const socketPaths = new Set(['/ws', '/api/ws']);
   const files = new Map([
     ['/', ['neon-strike.html', 'text/html']], ['/neon-strike.html', ['neon-strike.html', 'text/html']],
     ['/shared.js', ['shared.js', 'text/javascript']], ['/multiplayer.js', ['multiplayer.js', 'text/javascript']],
@@ -243,7 +244,12 @@ function createServer() {
   const server = http.createServer((req, res) => {
     if (!['GET', 'HEAD'].includes(req.method)) { res.writeHead(405); return res.end(); }
     const url = new URL(req.url, 'http://localhost');
+    if (socketPaths.has(url.pathname)) {
+      res.writeHead(426, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ error: 'WebSocket upgrade required', endpoint: '/api/ws' }));
+    }
     if (url.pathname === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end('{"ok":true}'); }
+    if (serverless) { res.writeHead(404); return res.end('Not found'); }
     const file = files.get(url.pathname);
     if (!file) { res.writeHead(404); return res.end('Not found'); }
     res.writeHead(200, { 'Content-Type': file[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
@@ -252,9 +258,12 @@ function createServer() {
   });
   const wss = new WebSocketServer({ noServer: true, maxPayload: 4096, perMessageDeflate: false });
   server.on('upgrade', (req, socket, head) => {
-    let allowed = req.url === '/ws';
+    let allowed = socketPaths.has(req.url);
     if (req.headers.origin) {
-      try { allowed &&= new URL(req.headers.origin).host === req.headers.host; } catch { allowed = false; }
+      try {
+        const origin = new URL(req.headers.origin);
+        allowed &&= ['http:', 'https:'].includes(origin.protocol) && origin.host === req.headers.host;
+      } catch { allowed = false; }
     }
     if (!allowed || wss.clients.size >= 1200) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
@@ -262,8 +271,9 @@ function createServer() {
   wss.on('connection', (ws, req) => {
     const localHost = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(req.headers.host || '');
     const lan = Object.values(os.networkInterfaces()).flat().find(i => i.family === 'IPv4' && !i.internal);
-    const port = server.address().port;
-    const inviteBase = process.env.PUBLIC_URL || (localHost && lan ? `http://${lan.address}:${port}` : null);
+    const port = server.address()?.port;
+    // Vercel may not expose a listening socket and must never advertise an internal IP.
+    const inviteBase = serverless ? null : (process.env.PUBLIC_URL || (localHost && lan && port ? `http://${lan.address}:${port}` : null));
     const client = arena.connect(ws, inviteBase); ws.alive = true;
     ws.on('pong', () => { ws.alive = true; });
     ws.on('message', (data, binary) => { if (!binary) arena.receive(client, data.toString()); });
@@ -281,6 +291,9 @@ function createServer() {
   const heartbeat = setInterval(() => {
     for (const ws of wss.clients) { if (!ws.alive) ws.terminate(); else { ws.alive = false; ws.ping(); } }
   }, 10000);
+  // An idle Function must be allowed to finish; live sockets keep the loop active.
+  if (serverless) { timer.unref(); heartbeat.unref(); }
+  server.on('close', () => { clearInterval(timer); clearInterval(heartbeat); });
   async function close() {
     clearInterval(timer); clearInterval(heartbeat);
     for (const ws of wss.clients) ws.terminate();

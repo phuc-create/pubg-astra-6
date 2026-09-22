@@ -2,6 +2,8 @@
 
 Trò chơi FPS Canvas chạy bằng JavaScript. Chế độ sinh tồn một người vẫn có sẵn; chế độ nhiều người dùng máy chủ Node.js/WebSocket để đồng bộ các máy.
 
+**Deploy toàn bộ lên Vercel:** xem [DEPLOY.md](DEPLOY.md). Giao diện dùng file tĩnh, phần nhiều người dùng WebSocket của Vercel Functions tại `/api/ws`. Không cần máy chủ riêng hoặc database. Phòng lưu trong bộ nhớ từng instance và chịu thời hạn Function, nên phương án này chỉ phù hợp thử nghiệm nhóm nhỏ.
+
 ## Chạy trò chơi
 
 Cần Node.js 22 trở lên. Tại thư mục dự án:
@@ -30,9 +32,9 @@ Mỗi đội tối đa **3 người**, mỗi phòng tối đa **4 đội / 12 ng
 - **Cùng Wi-Fi/LAN:** bạn bè mở `http://<IP-LAN-của-máy-chủ>:3000`. Khi chủ phòng mở bằng localhost, link mời tự dùng một địa chỉ IPv4 LAN của máy chủ. Nếu máy có nhiều card mạng/VPN, kiểm tra link mời chọn đúng IP.
 - `localhost` luôn chỉ chính thiết bị đang mở trình duyệt. Không gửi link localhost cho thiết bị khác.
 - Giữ tiến trình `npm start` chạy và cho phép kết nối đến cổng 3000 trên mạng nội bộ.
-- **Khác mạng/qua Internet:** cần triển khai server Node.js trên máy chủ có địa chỉ truy cập chung, hỗ trợ WebSocket `/ws`. Dùng HTTPS; trình duyệt tự chọn WSS. Reverse proxy phải chuyển tiếp WebSocket Upgrade và giữ đúng Host. Có thể đặt `PUBLIC_URL=https://game.example.com` để dùng địa chỉ đó cho link mời. Dự án chưa được triển khai lên Internet.
+- **Khác mạng/qua Internet:** deploy project lên Vercel theo [DEPLOY.md](DEPLOY.md), rồi mọi người mở cùng domain. Trình duyệt tự chọn WSS cho HTTPS. Không cần dựng máy chủ riêng; giới hạn phòng tạm và thời hạn Function được ghi trong hướng dẫn.
 - Chỉ gửi mã phòng là chưa đủ nếu mọi người đang mở các server khác nhau.
-- Chế độ nhiều người cần server; mở file HTML trực tiếp chỉ dùng được chế độ chơi đơn. Giữ `shared.js`, `multiplayer.js`, `multiplayer.css` cùng thư mục HTML.
+- Chế độ nhiều người cần kết nối WebSocket; mở file HTML trực tiếp chỉ dùng được chế độ chơi đơn. Giữ `shared.js`, `multiplayer.js`, `multiplayer.css` cùng thư mục HTML.
 
 Nếu báo lỗi kết nối, trò chơi tự thử mở lại tối đa 3 lần. Kiểm tra địa chỉ máy chủ và tải lại trang sau khi cập nhật code. Mất kết nối khi đang trong phòng sẽ đưa bạn về màn hình tham gia; bạn có thể nhập lại mã khi phòng ở sảnh. Phòng và điểm lưu trong bộ nhớ: khởi động lại server sẽ xóa các phòng đang có. Khi chủ phòng rời đi, quyền chủ phòng chuyển cho người còn lại; trận kết thúc nếu chỉ còn một đội.
 
