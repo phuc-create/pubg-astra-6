@@ -3,9 +3,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 // A whitelist keeps the game server, tests and backups out of the public site.
-const assets = ['neon-strike.html', 'shared.js', 'multiplayer.js', 'multiplayer.css'];
+const assets = ['neon-strike.html', 'shared.js', 'multiplayer.js', 'multiplayer.css', 'forest3d.bundle.js'];
 function buildStatic({ output = path.join(__dirname, '..', 'dist') } = {}) {
   const root = path.join(__dirname, '..');
+  require('./build-client').buildClient();
   fs.mkdirSync(output, { recursive: true });
   // Remove obsolete generated configuration files if this output directory is reused.
   for (const file of ['runtime-config.js', 'connection-config.js']) fs.rmSync(path.join(output, file), { force: true });

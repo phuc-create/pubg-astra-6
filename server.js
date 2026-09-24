@@ -5,9 +5,10 @@ const path = require('node:path');
 const os = require('node:os');
 const { randomInt, randomUUID } = require('node:crypto');
 const { WebSocketServer, WebSocket } = require('ws');
-const { WORLD, CONFIG: C, RULES: R, TEAMS, OBSTACLES, move, segmentRect, segmentCircle } = require('./shared');
+const Shared = require('./shared');
+const { WORLD, SPAWNS, CONFIG: C, RULES: R, TEAMS, PICKUP_RULES, createPickups, collectPickup, move, bulletOrigin, shotVelocity, segmentCover3D, segmentActor3D, clamp } = Shared;
 
-const EMPTY_INPUT = () => ({ x: 0, y: 0, angle: 0, fire: false, reload: false, dash: false });
+const EMPTY_INPUT = () => ({ x: 0, y: 0, angle: 0, pitch: 0, aiming: false, fire: false, reload: false, dash: false });
 function cleanName(value) {
   return typeof value === 'string' ? Array.from(value.normalize('NFC').replace(/[\p{Cc}\p{Cf}<>]/gu, '').trim()).slice(0, 18).join('') : '';
 }
@@ -52,7 +53,7 @@ class Arena {
         const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
         let code;
         do { code = Array.from({ length: 6 }, () => alphabet[randomInt(alphabet.length)]).join(''); } while (this.rooms.has(code));
-        room = { code, host: client.id, players: new Map(), teams: [], phase: 'lobby', elapsed: 0, bullets: [], result: null, events: [] };
+        room = { code, host: client.id, players: new Map(), teams: [], phase: 'lobby', elapsed: 0, bullets: [], pickups: [], result: null, events: [] };
         this.rooms.set(code, room);
       } else {
         const code = typeof msg.code === 'string' ? msg.code.trim().toUpperCase() : '';
@@ -63,8 +64,8 @@ class Arena {
       }
       client.room = room;
       room.players.set(client.id, { id: client.id, client, name, team: null, ready: false, kills: 0, deaths: 0,
-        input: EMPTY_INPUT(), seq: -1, x: 800, y: 450, r: 18, hp: C.maxHealth, angle: 0, ammo: C.magazine,
-        reload: 0, fireCooldown: 0, dash: 0, dashCooldown: 0, dashX: 0, dashY: 0, invulnerable: 0, respawn: 0 });
+        input: EMPTY_INPUT(), seq: -1, x: WORLD.width / 2, y: WORLD.height / 2, r: Shared.ACTOR.radius, hp: C.maxHealth, angle: 0, pitch: 0, aiming: false, ammo: C.magazine,
+        reload: 0, fireCooldown: 0, rapid: 0, dash: 0, dashCooldown: 0, dashX: 0, dashY: 0, invulnerable: 0, respawn: 0 });
       return this.broadcastRoom(room);
     }
     const room = client.room, p = room?.players.get(client.id);
@@ -72,9 +73,11 @@ class Arena {
     if (msg.type === 'input') {
       if (room.phase !== 'playing' || !Number.isSafeInteger(msg.seq) || msg.seq <= p.seq) return;
       if (![msg.x, msg.y, msg.angle].every(Number.isFinite) || Math.abs(msg.angle) > 1e6) return;
+      if (msg.pitch !== undefined && !Number.isFinite(msg.pitch)) return;
       const len = Math.max(1, Math.hypot(msg.x, msg.y));
       p.seq = msg.seq; p.input.x = msg.x / len; p.input.y = msg.y / len;
       p.input.angle = msg.angle % (Math.PI * 2); p.input.fire = msg.fire === true;
+      p.input.pitch = clamp(msg.pitch ?? 0, -.75, .75); p.input.aiming = msg.aiming === true;
       p.input.reload ||= msg.reload === true; p.input.dash ||= msg.dash === true;
       client.lastInput = now;
       return;
@@ -114,6 +117,7 @@ class Arena {
       if ([...room.players.values()].some(member => !member.team || !member.ready))
         return this.error(client, 'Tất cả người chơi cần chọn đội và sẵn sàng.');
       room.phase = 'playing'; room.elapsed = 0; room.bullets = []; room.events = []; room.result = null;
+      room.pickups = createPickups();
       for (const t of room.teams) t.score = 0;
       for (const member of room.players.values()) { member.kills = 0; member.deaths = 0; member.seq = -1; this.spawn(room, member); }
       this.broadcastRoom(room); this.snapshot(room);
@@ -121,14 +125,13 @@ class Arena {
   }
   spawn(room, p) {
     const index = TEAMS.findIndex(t => t.id === p.team);
-    const bases = [[110, 450], [1490, 450], [800, 100], [800, 800]];
-    const [bx, by] = bases[index];
+    const [bx, by] = SPAWNS[index];
     const candidates = [[bx, by], [bx, by - 48], [bx, by + 48], [bx - 48, by], [bx + 48, by]];
     const others = [...room.players.values()].filter(o => o.id !== p.id && o.hp > 0);
     const rank = ([x, y]) => others.reduce((min, o) => Math.min(min, Math.hypot(o.x - x, o.y - y)), 2000);
     candidates.sort((a, b) => rank(b) - rank(a));
-    [p.x, p.y] = candidates[0]; p.angle = Math.atan2(450 - p.y, 800 - p.x);
-    Object.assign(p, { hp: C.maxHealth, ammo: C.magazine, reload: 0, fireCooldown: 0, dash: 0,
+    [p.x, p.y] = candidates[0]; p.angle = Math.atan2(WORLD.height / 2 - p.y, WORLD.width / 2 - p.x);
+    Object.assign(p, { hp: C.maxHealth, ammo: C.magazine, reload: 0, fireCooldown: 0, rapid: 0, dash: 0, pitch: 0, aiming: false,
       dashCooldown: 0, invulnerable: R.spawnShield, respawn: 0, input: EMPTY_INPUT() });
     p.input.angle = p.angle;
   }
@@ -162,12 +165,15 @@ class Arena {
     for (const room of this.rooms.values()) {
       if (room.phase !== 'playing') continue;
       room.elapsed += dt;
+      for (const item of room.pickups) item.cooldown = Math.max(0, item.cooldown - dt);
       for (const p of room.players.values()) {
-        if (now - p.client.lastInput > 500) p.input = { ...EMPTY_INPUT(), angle: p.angle };
+        if (now - p.client.lastInput > 500) p.input = { ...EMPTY_INPUT(), angle: p.angle, pitch: p.pitch };
         if (p.hp <= 0) { p.respawn = Math.max(0, p.respawn - dt); if (!p.respawn) this.spawn(room, p); continue; }
-        for (const key of ['fireCooldown', 'dashCooldown', 'invulnerable']) p[key] = Math.max(0, p[key] - dt);
+        // Carry the fractional remainder so automatic fire is not slowed by tick rounding.
+        p.fireCooldown = p.fireCooldown > 0 ? p.fireCooldown - dt : 0;
+        for (const key of ['dashCooldown', 'invulnerable', 'rapid']) p[key] = Math.max(0, p[key] - dt);
         if (p.reload > 0) { p.reload = Math.max(0, p.reload - dt); if (!p.reload) p.ammo = C.magazine; }
-        const input = p.input; p.angle = input.angle;
+        const input = p.input; p.angle = input.angle; p.pitch = input.pitch ?? 0; p.aiming = input.aiming === true;
         if (input.dash && p.dashCooldown <= 0) {
           const len = Math.hypot(input.x, input.y);
           p.dashX = len ? input.x / len : Math.cos(p.angle); p.dashY = len ? input.y / len : Math.sin(p.angle);
@@ -177,33 +183,40 @@ class Arena {
           const duration = Math.min(dt, p.dash); move(p, p.dashX * C.dashSpeed * duration, p.dashY * C.dashSpeed * duration);
           p.dash = Math.max(0, p.dash - dt);
         } else move(p, input.x * C.playerSpeed * dt, input.y * C.playerSpeed * dt);
+        for (const item of room.pickups) {
+          const collected = collectPickup(p, item);
+          if (collected) room.events.push({ type: 'pickup', player: p.id, item: item.id, kind: collected.type, amount: collected.amount });
+        }
         if (input.reload && !p.reload && p.ammo < C.magazine) p.reload = C.reloadDuration;
         input.dash = false; input.reload = false;
-        if (input.fire && !p.reload && !p.fireCooldown && p.ammo > 0) {
+        if (input.fire && !p.reload && p.fireCooldown <= 1e-9 && p.ammo > 0) {
           // A protected player loses their spawn shield as soon as they attack.
-          p.invulnerable = 0; p.ammo--; p.fireCooldown = C.fireInterval;
-          room.bullets.push({ id: ++this.bulletId, owner: p.id, team: p.team, x: p.x, y: p.y,
-            vx: Math.cos(p.angle) * C.bulletSpeed, vy: Math.sin(p.angle) * C.bulletSpeed, life: 1.6 });
+          p.invulnerable = 0; p.ammo--; p.fireCooldown += C.fireInterval / (p.rapid > 0 ? PICKUP_RULES.rapidMultiplier : 1);
+          const targets = [...room.players.values()].filter(other => other.id !== p.id && other.hp > 0 && other.team !== p.team);
+          const aim = Shared.aimSolution ? Shared.aimSolution(p, targets) : p;
+          room.bullets.push({ id: ++this.bulletId, owner: p.id, team: p.team, ...bulletOrigin(p),
+            ...shotVelocity(aim.angle, aim.pitch, C.bulletSpeed), life: C.bulletLifetime });
           if (!p.ammo) p.reload = C.reloadDuration;
         }
       }
       for (const b of room.bullets) {
-        const nx = b.x + b.vx * dt, ny = b.y + b.vy * dt;
-        let hit = 2, target = null;
-        for (const o of OBSTACLES) { const t = segmentRect(b.x, b.y, nx, ny, o); if (t !== null && t < hit) hit = t; }
+        const travelTime = Math.min(dt, Math.max(0, b.life));
+        b.z ??= bulletOrigin(b).z; b.vz ??= 0;
+        const end = { x: b.x + b.vx * travelTime, y: b.y + b.vy * travelTime, z: b.z + b.vz * travelTime };
+        let hit = segmentCover3D(b, end) ?? 2, target = null;
         for (const p of room.players.values()) {
           if (p.hp <= 0 || p.team === b.team || p.invulnerable > 0) continue;
-          const t = segmentCircle(b.x, b.y, nx, ny, p, p.r + 2);
+          const t = segmentActor3D(b, end, p);
           if (t !== null && t < hit) { hit = t; target = p; }
         }
-        b.x = nx; b.y = ny; b.life -= dt;
+        b.x = end.x; b.y = end.y; b.z = end.z; b.life -= dt;
         if (hit <= 1) {
           b.life = 0;
           if (target) {
             target.hp = Math.max(0, target.hp - C.bulletDamage);
             room.events.push({ type: 'hit', shooter: b.owner, target: target.id });
             if (!target.hp) {
-              target.deaths++; target.respawn = R.respawn; target.input = EMPTY_INPUT();
+              target.deaths++; target.respawn = R.respawn; target.rapid = 0; target.input = EMPTY_INPUT();
               const shooter = room.players.get(b.owner); if (shooter) shooter.kills++;
               const team = room.teams.find(t => t.id === b.team); if (team) team.score++;
               room.events.push({ type: 'kill', shooter: b.owner, target: target.id, team: b.team });
@@ -220,15 +233,16 @@ class Arena {
     if (room.phase !== 'playing') return;
     const round = n => Math.round(n * 1000) / 1000;
     const players = [...room.players.values()].map(p => {
-      const result = { id: p.id, team: p.team, seq: p.seq, kills: p.kills, deaths: p.deaths };
-      for (const k of ['x', 'y', 'angle', 'hp', 'ammo', 'reload', 'dash', 'dashX', 'dashY', 'dashCooldown', 'fireCooldown', 'invulnerable', 'respawn']) result[k] = round(p[k]);
+      const result = { id: p.id, team: p.team, seq: p.seq, kills: p.kills, deaths: p.deaths, aiming: p.aiming };
+      for (const k of ['x', 'y', 'angle', 'pitch', 'hp', 'ammo', 'reload', 'rapid', 'dash', 'dashX', 'dashY', 'dashCooldown', 'fireCooldown', 'invulnerable', 'respawn']) result[k] = round(p[k]);
       return result;
     });
     for (const viewer of room.players.values()) this.send(viewer.client, { type: 'snapshot', elapsed: round(room.elapsed),
       teams: room.teams, events: room.events,
+      pickups: room.pickups.filter(p => p.cooldown <= 0).map(({ id, x, y, type }) => ({ id, x, y, type })),
       // Enemy nameplates cannot accidentally leak through the rendering layer.
       players: players.map(p => ({ ...p, name: p.team === viewer.team ? room.players.get(p.id).name : '' })),
-      bullets: room.bullets.map(b => ({ id: b.id, team: b.team, x: round(b.x), y: round(b.y), vx: round(b.vx), vy: round(b.vy) })) });
+      bullets: room.bullets.map(b => ({ id: b.id, team: b.team, x: round(b.x), y: round(b.y), z: round(b.z), vx: round(b.vx), vy: round(b.vy), vz: round(b.vz) })) });
     room.events = [];
   }
 }
@@ -239,7 +253,8 @@ function createServer({ serverless = false } = {}) {
   const files = new Map([
     ['/', ['neon-strike.html', 'text/html']], ['/neon-strike.html', ['neon-strike.html', 'text/html']],
     ['/shared.js', ['shared.js', 'text/javascript']], ['/multiplayer.js', ['multiplayer.js', 'text/javascript']],
-    ['/multiplayer.css', ['multiplayer.css', 'text/css']]
+    ['/multiplayer.css', ['multiplayer.css', 'text/css']],
+    ['/forest3d.bundle.js', ['forest3d.bundle.js', 'text/javascript']]
   ]);
   const server = http.createServer((req, res) => {
     if (!['GET', 'HEAD'].includes(req.method)) { res.writeHead(405); return res.end(); }

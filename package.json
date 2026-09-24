@@ -2,13 +2,22 @@
   "name": "neon-strike",
   "version": "3.0.0",
   "private": true,
-  "description": "NEON STRIKE FPS — phòng chơi và đấu đội thời gian thực",
+  "description": "NEON STRIKE TPS — khám phá nhà, nhặt vật phẩm và đấu đội thời gian thực",
   "scripts": {
     "build": "node scripts/build-static.js",
     "start": "node server.js",
     "test": "node --test tests/*.test.js",
-    "check": "node --check server.js && node --check shared.js && node --check multiplayer.js && node --check api/ws.mjs && node --check scripts/build-static.js"
+    "check": "node --check server.js && node --check shared.js && node --check multiplayer.js && node --check api/ws.mjs && node --check scripts/build-static.js && node --check scripts/build-client.js",
+    "prestart": "node scripts/build-client.js"
   },
-  "engines": { "node": ">=22" },
-  "dependencies": { "ws": "^8.18.3" }
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "three": "^0.184.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12"
+  }
 }

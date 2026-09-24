@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const { WebSocket } = require('ws');
 const { Arena, createServer, cleanName } = require('../server');
-const { RULES, CONFIG, move, OBSTACLES } = require('../shared');
+const { WORLD, RULES, CONFIG, move, OBSTACLES } = require('../shared');
 
 function fixture(count = 3) {
   const arena = new Arena();
@@ -96,9 +96,9 @@ test('input cannot teleport or change stats; invalid/stale inputs are ignored', 
 });
 
 test('movement and dashes collide with cover and world bounds', () => {
-  const wall = OBSTACLES[0], p = { x: wall.x - 30, y: wall.y + 40, r: 18 };
+  const wall = OBSTACLES.find(o => o.kind === 'rock'), p = { x: wall.x - 30, y: wall.y + wall.h / 2, r: 18 };
   move(p, 140, 0); assert.ok(p.x <= wall.x - p.r + .001);
-  move(p, -2000, -2000); assert.ok(p.x >= 46 && p.y >= 46);
+  move(p, -5000, -5000); assert.ok(p.x >= WORLD.margin + p.r && p.y >= WORLD.margin + p.r);
 });
 
 test('friendly fire is ignored; enemy hits score once and victims respawn', () => {
@@ -115,7 +115,9 @@ test('friendly fire is ignored; enemy hits score once and victims respawn', () =
 test('cover blocks projectiles before an enemy and spawn protection blocks damage', () => {
   const f = match(), [shooter, ally, enemy] = f.players;
   fireAt(f, shooter, enemy); ally.y = 100;
-  Object.assign(shooter, { x: 220, y: 250 }); Object.assign(enemy, { x: 500, y: 250 });
+  const wall = OBSTACLES.find(o => o.kind === 'rock');
+  Object.assign(shooter, { x: wall.x - 50, y: wall.y + wall.h / 2 });
+  Object.assign(enemy, { x: wall.x + wall.w + 50, y: wall.y + wall.h / 2 });
   for (let i = 0; i < 40; i++) f.arena.step(1 / 60);
   assert.equal(enemy.hp, 100);
   f.room.bullets = []; fireAt(f, shooter, enemy, { invulnerable: 1.5 });
@@ -133,6 +135,53 @@ test('reload, firing cadence and dash cooldown are server-authoritative', () => 
   p.input.fire = false;
   for (let i = 0; i < 75; i++) f.arena.step(1 / 60);
   assert.equal(p.ammo, 30);
+});
+
+test('held rifle fire maintains 600 RPM across simulation tick sizes', () => {
+  for (const ticksPerSecond of [30, 60, 120]) {
+    const f = match(), p = f.players[0], now = Date.now();
+    Object.assign(p, { x: 1000, y: 1780, invulnerable: 0 });
+    p.client.lastInput = now;
+    p.input = { x: 0, y: 0, angle: 0, fire: true };
+    for (let i = 0; i < ticksPerSecond; i++) f.arena.step(1 / ticksPerSecond, now);
+    assert.equal(30 - p.ammo, 10, `${ticksPerSecond} Hz should fire ten rounds per second`);
+  }
+});
+
+test('a fast rifle round hits a small target between ticks without tunnelling', () => {
+  const f = match(), [shooter, ally, enemy] = f.players;
+  Object.assign(shooter, { x: 1000, y: 1780, invulnerable: 0 });
+  Object.assign(enemy, { x: 1630, y: 1780, invulnerable: 0 });
+  ally.y = 1700;
+  shooter.client.lastInput = Date.now();
+  shooter.input = { x: 0, y: 0, angle: 0, fire: true };
+  f.arena.step(1 / 60); shooter.input.fire = false;
+  for (let i = 0; i < 9; i++) f.arena.step(1 / 60);
+  assert.equal(enemy.hp, 100, 'the round has not reached the target yet');
+  f.arena.step(1 / 60);
+  assert.equal(enemy.hp, 100 - CONFIG.bulletDamage, 'the swept path must hit even when both endpoints miss');
+  assert.equal(f.room.bullets.length, 0);
+});
+
+test('fast rounds hit thin house walls and cannot damage beyond their remaining range', () => {
+  const f = match(), [shooter, ally, enemy] = f.players;
+  // Both the wall and target are inside one 60-unit tick of travel.
+  Object.assign(shooter, { x: 1570, y: 1608, invulnerable: 0 });
+  Object.assign(enemy, { x: 1570, y: 1665, invulnerable: 0 });
+  ally.y = 1700;
+  shooter.client.lastInput = Date.now();
+  shooter.input = { x: 0, y: 0, angle: Math.PI / 2, fire: true };
+  f.arena.step(1 / 60); shooter.input.fire = false;
+  assert.equal(enemy.hp, 100, 'the 14-unit wall must block a faster round');
+  assert.equal(f.room.bullets.length, 0);
+
+  Object.assign(shooter, { x: 600, y: 1780 });
+  Object.assign(enemy, { x: 645, y: 1780 });
+  f.room.bullets.push({ id: 1000, owner: shooter.id, team: shooter.team,
+    x: 600, y: 1780, vx: CONFIG.bulletSpeed, vy: 0, life: .005 });
+  f.arena.step(1 / 60);
+  assert.equal(enemy.hp, 100, 'only the remaining 18 units may be swept on the final tick');
+  assert.equal(f.room.bullets.length, 0);
 });
 
 test('score limit, rematch and timeout produce deterministic results', () => {
@@ -194,7 +243,12 @@ test('independent WebSocket clients share rooms, movement and combat on the real
   const initial = await wait(0, m => m.type === 'snapshot');
   assert.equal(initial.players.find(p => p.team === 'coral').name, '');
   const selfId = (await wait(0, m => m.type === 'hello')).id;
-  const start = initial.players.find(p => p.id === selfId);
+  // Arrange a clear firing lane; forest bases deliberately have no spawn-to-spawn sightline.
+  const room = app.arena.rooms.get(lobby.code);
+  for (const p of room.players.values()) {
+    p.x = p.id === selfId ? 1000 : p.team === 'coral' ? 1240 : 1120;
+    p.y = 1780; p.invulnerable = 0;
+  }
   let seq = 0;
   const input = setInterval(() => peers[0].send({ type: 'input', seq: ++seq, x: 0, y: 0, angle: 0, fire: true }), 40);
   t.after(() => clearInterval(input));
@@ -204,10 +258,44 @@ test('independent WebSocket clients share rooms, movement and combat on the real
   assert.equal(scored.teams.find(t => t.id === 'mint').score, 1);
   clearInterval(input);
   peers[0].send({ type: 'input', seq: ++seq, x: 1, y: 0, angle: 0, fire: false });
-  await wait(1, m => m.type === 'snapshot' && m.players.find(p => p.id === selfId).x > start.x + 10);
+  await wait(1, m => m.type === 'snapshot' && m.players.find(p => p.id === selfId).x > 1010);
   peers[0].ws.close();
   await wait(1, m => m.type === 'room' && m.host !== selfId);
   peers[2].ws.close();
   const ended = await wait(1, m => m.type === 'room' && m.phase === 'ended');
   assert.equal(ended.result.winner, 'mint');
+});
+
+test('only one player collects each pickup and snapshots agree; items respawn per room', () => {
+  const f=match(),[a,b]=f.players, item=f.room.pickups.find(p=>p.type==='health');
+  Object.assign(a,{x:item.x,y:item.y,hp:50});Object.assign(b,{x:item.x,y:item.y,hp:50});
+  f.arena.step(1/60);
+  assert.equal(a.hp,85);assert.equal(b.hp,50);assert.ok(item.cooldown>24);
+  f.arena.snapshot(f.room);
+  for(let i=0;i<3;i++)assert.ok(!f.last(i).pickups.some(p=>p.id===item.id));
+  assert.equal(f.last(0).events.filter(e=>e.type==='pickup'&&e.item===item.id).length,1);
+  const other=match();assert.equal(other.room.pickups.find(p=>p.id===item.id).cooldown,0);
+  a.x=b.x=1000;a.y=b.y=1780;
+  for(let i=0;i<26;i++)f.arena.step(1);
+  f.arena.snapshot(f.room);assert.ok(f.last(0).pickups.some(p=>p.id===item.id));
+});
+
+test('rapid-fire loot increases authoritative cadence, expires and resets on respawn/rematch', () => {
+  const f=match(),p=f.players[0],item=f.room.pickups.find(p=>p.type==='rapid');
+  Object.assign(p,{x:item.x,y:item.y,invulnerable:0});f.arena.step(1/60);
+  assert.equal(p.rapid,10);assert.ok(item.cooldown>0);
+  p.x=1000;p.y=1780;p.client.lastInput=Date.now();p.input={x:0,y:0,angle:0,fire:true};
+  for(let i=0;i<60;i++)f.arena.step(1/60);
+  const boosted=30-p.ammo;
+  assert.ok(boosted>=17&&boosted<=18);
+  f.arena.snapshot(f.room);assert.ok(f.last(0).players.find(x=>x.id===p.id).rapid>8);
+  p.input.fire=false;for(let i=0;i<10;i++)f.arena.step(1);
+  assert.equal(p.rapid,0);
+  p.ammo=30;p.reload=0;p.fireCooldown=0;p.client.lastInput=Date.now();p.input.fire=true;
+  for(let i=0;i<60;i++)f.arena.step(1/60);
+  assert.ok(30-p.ammo<boosted);
+  p.rapid=8;f.arena.spawn(f.room,p);assert.equal(p.rapid,0);
+  f.arena.finish(f.room,'test');f.send(0,{type:'back'});
+  for(let i=0;i<3;i++)f.send(i,{type:'ready',ready:true});f.send(0,{type:'start'});
+  assert.ok(f.room.pickups.every(p=>p.cooldown===0));
 });

@@ -218,7 +218,8 @@
     const previous = net.self, wasDead = previous?.hp <= 0;
     const predicted = net.history.get(self.seq);
     if (!previous || (wasDead && self.hp > 0) || Math.hypot(player.x - self.x, player.y - self.y) > 180) {
-      player.x = self.x; player.y = self.y; player.angle = self.angle; net.correctedX = net.correctedY = 0; net.history.clear();
+      player.x = self.x; player.y = self.y; player.angle = self.angle; player.pitch = self.pitch || 0;
+      player.aiming = false; net.correctedX = net.correctedY = 0; net.history.clear();
     } else if (predicted) {
       // Compare positions at the acknowledged input, preserving newer local movement.
       net.correctedX += self.x - predicted.x; net.correctedY += self.y - predicted.y;
@@ -226,10 +227,13 @@
     }
     for (const seq of net.history.keys()) if (seq <= self.seq) net.history.delete(seq);
     if (previous && self.hp < previous.hp) { damageFlash = .5; sfx('hurt'); }
-    if (previous && self.ammo < previous.ammo) { player.muzzle = .085; sfx('shoot'); }
+    if (self.hp <= 0) clearPointer();
+    if (previous && self.ammo < previous.ammo) { player.muzzle = .045; sfx('shoot'); }
     if (previous && !previous.reload && self.reload > 0) sfx('reload');
     if (previous && !previous.dash && self.dash > 0) sfx('dash');
     for (const key of ['hp', 'ammo', 'reload', 'dash', 'dashX', 'dashY', 'dashCooldown', 'fireCooldown', 'invulnerable']) player[key] = self[key];
+    rapidTimer = self.rapid || 0;
+    drops = message.pickups || [];
     net.self = self; elapsed = message.elapsed; net.room.teams = message.teams;
     kills = self.kills; score = message.teams.find(t => t.id === self.team)?.score || 0;
     const alive = new Set();
@@ -240,8 +244,12 @@
       net.actors.set(p.id, { ...p, fromX: jump ? old.x : p.x, fromY: jump ? old.y : p.y, targetX: p.x, targetY: p.y, x: jump ? old.x : p.x, y: jump ? old.y : p.y });
     }
     for (const id of net.actors.keys()) if (!alive.has(id)) net.actors.delete(id);
-    net.shots = message.bullets; net.samplesAt = performance.now();
+    net.shots = message.bullets.map(b => ({ ...b, extrapolationLeft: 1 / RULES.snapshotRate }));
+    net.samplesAt = performance.now();
     for (const event of message.events) {
+      if (event.type === 'pickup' && event.player === net.me) {
+        sfx('pickup'); toast(event.kind === 'health' ? `+${event.amount} SINH LỰC` : `BẮN NHANH ×${NeonShared.PICKUP_RULES.rapidMultiplier} · ${event.amount} GIÂY`);
+      }
       if (event.shooter === net.me) { hitmarker = .17; if (event.type === 'hit') sfx('hit'); if (event.type === 'kill') { sfx('kill'); toast('+1 ĐIỂM CHO ĐỘI'); } }
     }
     updateHud();
@@ -253,7 +261,8 @@
     const seq = ++net.seq;
     net.history.set(seq, { x: player.x + net.correctedX, y: player.y + net.correctedY });
     while (net.history.size > 120) net.history.delete(net.history.keys().next().value);
-    send({ type: 'input', seq, ...input, angle: player.angle, fire: active && pointer.down,
+    send({ type: 'input', seq, ...input, angle: player.angle, pitch: player.pitch || 0,
+      aiming: active && !!player.aiming, fire: active && pointer.down,
       reload: active && net.reload, dash: active && net.dash });
     net.reload = false; net.dash = false;
   }
@@ -264,6 +273,18 @@
       else send({ type: 'ping', at: performance.now() });
     }
   }, 2000);
+  function advanceVisualShots(dt) {
+    // Only bridge one snapshot interval. Damage remains entirely server-authoritative.
+    net.shots = net.shots.filter(b => {
+      const travelTime = Math.min(dt, b.extrapolationLeft);
+      if (travelTime <= 1e-9) return false;
+      const start = { x:b.x, y:b.y, z:b.z ?? NeonShared.bulletOrigin(b).z };
+      const end = { x:b.x+b.vx*travelTime, y:b.y+b.vy*travelTime, z:start.z+(b.vz||0)*travelTime };
+      if (NeonShared.segmentCover3D(start,end) !== null) return false;
+      b.x = end.x; b.y = end.y; b.z = end.z; b.extrapolationLeft -= travelTime;
+      return true;
+    });
+  }
   update = function (dt) {
     if (!net.online) { solo.update(dt); return; }
     updateEffects(dt);
@@ -281,9 +302,10 @@
     move(player, net.correctedX * correction, net.correctedY * correction);
     net.correctedX *= 1 - correction; net.correctedY *= 1 - correction;
     player.muzzle = Math.max(0, player.muzzle - dt);
+    rapidTimer = Math.max(0, rapidTimer - dt);
     const alpha = clamp((performance.now() - net.samplesAt) / 50, 0, 1);
     for (const p of net.actors.values()) { p.x = p.fromX + (p.targetX - p.fromX) * alpha; p.y = p.fromY + (p.targetY - p.fromY) * alpha; }
-    for (const b of net.shots) { b.x += b.vx * dt; b.y += b.vy * dt; }
+    advanceVisualShots(dt);
   };
   updateHud = function () {
     solo.updateHud(); if (!net.online) return;
@@ -303,36 +325,28 @@
   resumeGame = function () { solo.resumeGame(); if (net.online) transmit(); };
   startGame = function () { if (net.room || net.opened) return; solo.startGame(); };
 
-  // Palette-coloured armour is generated once. The same sprites are used by all peers.
-  const actorSprites = new Map(), shotSprites = new Map();
-  for (const team of TEAMS) {
-    const image = document.createElement('canvas'); image.width = 64; image.height = 104;
-    const c = image.getContext('2d');
-    const box = (x, y, w, h, color) => { c.fillStyle = '#07121b'; c.fillRect(x - 2, y - 2, w + 4, h + 4); c.fillStyle = color; c.fillRect(x, y, w, h); };
-    box(17, 69, 12, 28, '#394f62'); box(36, 69, 12, 28, '#394f62');
-    box(13, 94, 17, 6, team.color); box(35, 94, 17, 6, team.color);
-    box(9, 34, 9, 28, team.color); box(47, 34, 9, 28, team.color);
-    box(17, 31, 30, 34, team.color); box(23, 38, 18, 22, '#213543');
-    box(21, 8, 23, 21, team.color); box(18, 18, 29, 7, '#11222e');
-    c.fillStyle = '#ddffff'; c.fillRect(23, 20, 19, 2);
-    box(43, 51, 12, 27, '#546c7c'); box(20, 64, 24, 5, '#8297a5');
-    c.fillStyle = team.color; c.font = 'bold 16px Arial'; c.textAlign = 'center'; c.fillText(team.symbol, 32, 55);
-    actorSprites.set(team.id, image);
-    const shot = document.createElement('canvas'); shot.width = shot.height = 16;
-    const sc = shot.getContext('2d'), gradient = sc.createRadialGradient(8, 8, 0, 8, 8, 8);
-    gradient.addColorStop(0, '#ffffff'); gradient.addColorStop(.3, team.color); gradient.addColorStop(1, team.color + '00');
-    sc.fillStyle = gradient; sc.fillRect(0, 0, 16, 16); shotSprites.set(team.id, shot);
-  }
   window.NeonMultiplayer = Object.freeze({
     inLobby: () => net.opened,
     color: () => net.online ? myTeam()?.color : null,
-    addSprites(add) {
+    renderState() {
+      if (!net.online) return null;
+      return { color: myTeam()?.color, shots: net.shots,
+        actors: Array.from(net.actors.values(), p => {
+          const friendly = p.team === mine()?.team;
+          return { id: p.id, x: p.x, y: p.y, angle: p.angle, pitch:p.pitch || 0, aiming:!!p.aiming, hp: p.hp, reload: p.reload, muzzle: p.fireCooldown > 0 && p.fireCooldown > CONFIG.fireInterval / (p.rapid > 0 ? NeonShared.PICKUP_RULES.rapidMultiplier : 1) - .03 ? .03 : 0,
+            color: teamById(p.team).color, friendly, name: friendly ? p.name : '' };
+        }) };
+    },
+    drawTopDown(c) {
       if (!net.online) return;
       for (const p of net.actors.values()) if (p.hp > 0) {
-        const team = teamById(p.team), friendly = p.team === mine()?.team;
-        add(p, actorSprites.get(p.team), 48, 100, 0, p.invulnerable > 0 ? .7 : 1, friendly ? `${team.symbol} ${p.name}` : '', team.color);
+        const team = teamById(p.team);
+        drawRobot({ ...p, r:NeonShared.ACTOR.radius, type:'shooter', color:team.color, hit:0, spawn:0 }, true);
+        if (p.team === mine()?.team && !NeonShared.OBSTACLES.some(o => NeonShared.segmentRect(player.x,player.y,p.x,p.y,o)!==null)) {
+          c.fillStyle=team.color;c.font='14px Arial';c.textAlign='center';c.fillText(p.name,p.x,p.y-35);
+        }
       }
-      for (const b of net.shots) add(b, shotSprites.get(b.team), 10, 10, 49);
+      for (const b of net.shots) drawProjectile(b);
     },
     drawRadar(c, scale) {
       if (!net.online) return;
